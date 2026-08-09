@@ -37,6 +37,14 @@ pub enum CueBladeError {
         source: std::io::Error,
     },
 
+    /// CUE sanitization failed.
+    #[error("CUE sanitization error: {reason}")]
+    Sanitization { reason: String },
+
+    /// Referenced audio file not found after fallback chain.
+    #[error("Audio file not found: `{path}` (tried: {tried:?})")]
+    FileNotFound { path: String, tried: Vec<String> },
+
     /// Catch-all for other errors.
     #[error("{0}")]
     Other(String),
