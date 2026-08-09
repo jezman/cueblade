@@ -8,25 +8,31 @@ use std::process;
 
 use clap::Parser;
 
-use cueblade::cli::{Cli, Mode};
+use cueblade::cli::{Cli, Mode, ResolvedConfig};
 use cueblade::codec::{self, Encoder};
 use cueblade::cue;
 use cueblade::discovery;
+use cueblade::pipeline::overwrite::{OverwriteDecision, OverwritePolicy};
 use cueblade::safety;
+use cueblade::template::{self, TemplateContext};
 
 fn main() {
     let cli = Cli::parse();
 
-    let mode = match cli.resolve() {
-        Ok(m) => m,
+    let config = match cli.resolve() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
             process::exit(2);
         }
     };
 
-    let result = match mode {
-        Mode::Explicit { flac, cue, out } => run_explicit(&flac, &cue, &out),
+    let result = match config.mode {
+        Mode::Explicit {
+            ref flac,
+            ref cue,
+            ref out,
+        } => run_explicit(flac, cue, out, &config),
     };
 
     match result {
@@ -38,6 +44,13 @@ fn main() {
     }
 }
 
+/// Print a message unless silent mode is active.
+fn log(config: &ResolvedConfig, msg: &str) {
+    if !config.silent {
+        eprintln!("{msg}");
+    }
+}
+
 /// Execute explicit mode: parse CUE → sanitize → decode → encode → atomic write.
 ///
 /// Single-threaded pipeline for one source file. Rayon parallelism
@@ -46,13 +59,17 @@ fn run_explicit(
     flac_path: &std::path::Path,
     cue_path: &std::path::Path,
     out_dir: &std::path::Path,
+    config: &ResolvedConfig,
 ) -> cueblade::error::Result<()> {
     // 1. Discovery: validate paths
     let source = discovery::discover_explicit(flac_path, cue_path)?;
-    eprintln!(
-        "Source: {} + {}",
-        source.audio_path.display(),
-        source.cue_path.display()
+    log(
+        config,
+        &format!(
+            "Source: {} + {}",
+            source.audio_path.display(),
+            source.cue_path.display()
+        ),
     );
 
     // 2. Parse CUE
@@ -62,7 +79,10 @@ fn run_explicit(
             source: e,
         })?;
     let cue_sheet = cue::parse_cue(&cue_bytes)?;
-    eprintln!("Parsed CUE: {} tracks", cue_sheet.tracks.len());
+    log(
+        config,
+        &format!("Parsed CUE: {} tracks", cue_sheet.tracks.len()),
+    );
 
     // 3. Sanitize
     let base_dir = source
@@ -70,27 +90,41 @@ fn run_explicit(
         .parent()
         .unwrap_or(std::path::Path::new("."));
     let sanitized = cue::sanitize(cue_sheet, base_dir)?;
-    eprintln!(
-        "Sanitized: resolved audio = {}",
-        sanitized.resolved_audio_path().display()
+    log(
+        config,
+        &format!(
+            "Sanitized: resolved audio = {}",
+            sanitized.resolved_audio_path().display()
+        ),
     );
 
     // 4. Open decoder
     let mut decoder = codec::open_decoder(sanitized.resolved_audio_path())?;
     let info = decoder.audio_info().clone();
-    eprintln!(
-        "Audio: {} Hz, {} ch, {} bps",
-        info.sample_rate, info.channels, info.bits_per_sample
+    log(
+        config,
+        &format!(
+            "Audio: {} Hz, {} ch, {} bps",
+            info.sample_rate, info.channels, info.bits_per_sample
+        ),
     );
 
-    // 5. Ensure output directory exists
-    std::fs::create_dir_all(out_dir).map_err(|e| cueblade::error::CueBladeError::Io {
-        path: out_dir.to_path_buf(),
-        source: e,
-    })?;
+    // 5. Ensure output directory exists (unless dry-run)
+    if !config.dry_run {
+        std::fs::create_dir_all(out_dir).map_err(|e| cueblade::error::CueBladeError::Io {
+            path: out_dir.to_path_buf(),
+            source: e,
+        })?;
+    }
 
-    // 6. Process each track: decode range → encode → atomic write
+    // 6. Setup overwrite policy
+    let overwrite_policy = OverwritePolicy::new(config.overwrite);
+
+    // 7. Process each track
     let cue_data = sanitized.cue();
+    let mut skipped = 0usize;
+    let mut written = 0usize;
+
     for (i, track) in cue_data.tracks.iter().enumerate() {
         // Determine sample range from indices
         let start_idx = track
@@ -102,7 +136,6 @@ fn run_explicit(
             })?;
 
         let end_frames = if i + 1 < cue_data.tracks.len() {
-            // End at next track's INDEX 01
             let next_track = &cue_data.tracks[i + 1];
             next_track
                 .indices
@@ -115,7 +148,6 @@ fn run_explicit(
                         .unwrap_or(u64::MAX)
                 })
         } else {
-            // Last track: use total samples or MAX
             info.total_samples
                 .map(|s| s * 75 / info.sample_rate as u64)
                 .unwrap_or(u64::MAX)
@@ -136,7 +168,6 @@ fn run_explicit(
             }
         })?;
 
-        // Clamp end to available samples
         let end_samples = if let Some(total) = info.total_samples {
             end_samples.min(total)
         } else {
@@ -144,21 +175,57 @@ fn run_explicit(
         };
 
         if start_samples >= end_samples {
-            eprintln!(
-                "Skipping track {}: empty range ({start_samples}..{end_samples})",
-                track.number
+            log(
+                config,
+                &format!(
+                    "Skipping track {}: empty range ({start_samples}..{end_samples})",
+                    track.number
+                ),
             );
+            skipped += 1;
             continue;
         }
 
-        // Build output filename: NN - Title.flac
-        let title = track.title.as_deref().unwrap_or("Untitled");
-        let filename = format!("{:02} - {title}.flac", track.number);
-        let relative_path = std::path::Path::new(&filename);
+        // Render output filename from template
+        let ctx = TemplateContext::from_track(track, cue_data);
+        let relative_path_str = template::render_template(&config.template, &ctx)?;
+        let relative_path = std::path::Path::new(&relative_path_str);
+        let output_path = out_dir.join(relative_path);
 
-        eprintln!(
-            "Track {:02}: {} [{start_samples}..{end_samples}] → {}",
-            track.number, title, filename
+        // Check overwrite policy
+        match overwrite_policy.check(&output_path, &source.audio_path)? {
+            OverwriteDecision::Skip => {
+                log(
+                    config,
+                    &format!(
+                        "Skipping track {:02}: {} → {} (exists)",
+                        track.number, ctx.title, relative_path_str
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
+            OverwriteDecision::Write => {}
+        }
+
+        if config.dry_run {
+            log(
+                config,
+                &format!(
+                    "[DRY-RUN] Track {:02}: {} [{start_samples}..{end_samples}] → {}",
+                    track.number, ctx.title, relative_path_str
+                ),
+            );
+            written += 1;
+            continue;
+        }
+
+        log(
+            config,
+            &format!(
+                "Track {:02}: {} [{start_samples}..{end_samples}] → {}",
+                track.number, ctx.title, relative_path_str
+            ),
         );
 
         // Seek to start
@@ -197,7 +264,7 @@ fn run_explicit(
                 let to_read = remaining.min(buffer_size);
                 let read = decoder.read_samples(&mut read_buffer, to_read)?;
                 if read == 0 {
-                    break; // EOF
+                    break;
                 }
                 encoder.write_samples(&read_buffer[..read * channels], read)?;
                 remaining -= read;
@@ -206,8 +273,13 @@ fn run_explicit(
             encoder.finish()?;
             Ok(())
         })?;
+
+        written += 1;
     }
 
-    eprintln!("Done.");
+    log(
+        config,
+        &format!("Done. Written: {written}, Skipped: {skipped}"),
+    );
     Ok(())
 }
