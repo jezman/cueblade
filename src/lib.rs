@@ -1,7 +1,9 @@
 //! cueblade library crate.
 //!
 //! Provides CUE parsing, audio codec pipelines, discovery engine,
-//! and safety primitives for the cueblade CLI tool.
+//! safety primitives, and sanitization for the cueblade CLI tool.
 
+pub mod codec;
 pub mod cue;
 pub mod error;
+pub mod safety;

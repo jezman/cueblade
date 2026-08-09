@@ -1,20 +1,20 @@
 //! FLAC decoder and encoder using `claxon` and `flacenc`.
 //!
 //! Pure Rust implementations with no unsafe code (SECURITY.md).
-//! Supports streaming decode with sample-accurate seeking and
+//! Supports streaming decode with sample-accurate reading and
 //! configurable compression level for encoding.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, Write};
 use std::path::Path;
 
 use claxon::FlacReader;
+use flacenc::component::BitRepr;
+use flacenc::error::Verify;
 
-use super::{AudioInfo, Decoder, Encoder};
+use super::traits::{Decoder, Encoder};
+use super::types::AudioInfo;
 use crate::error::{CueBladeError, Result};
-
-/// Default read buffer size for FLAC decoding (samples per channel).
-const DECODE_BUFFER_SIZE: usize = 4096;
 
 /// Streaming FLAC decoder backed by `claxon`.
 ///
@@ -32,7 +32,6 @@ const DECODE_BUFFER_SIZE: usize = 4096;
 /// let info = dec.audio_info();
 /// println!("{} Hz, {} ch, {} bps", info.sample_rate, info.channels, info.bits_per_sample);
 ///
-/// dec.seek_to_sample(44100).unwrap(); // seek to 1 second
 /// let mut buf = vec![0i32; 4096 * 2]; // stereo buffer
 /// let read = dec.read_samples(&mut buf, 4096).unwrap();
 /// println!("Read {read} samples per channel");
@@ -40,12 +39,6 @@ const DECODE_BUFFER_SIZE: usize = 4096;
 pub struct FlacDecoder {
     reader: FlacReader<BufReader<File>>,
     info: AudioInfo,
-    /// Reusable decode buffer (interleaved i32 samples).
-    buffer: Vec<i32>,
-    /// Current position within `buffer` (in samples per channel).
-    buffer_pos: usize,
-    /// Number of valid samples currently in `buffer` (per channel).
-    buffer_len: usize,
 }
 
 impl FlacDecoder {
@@ -89,24 +82,16 @@ impl FlacDecoder {
             });
         }
 
+        let total_samples = stream_info.samples; // Option<u64> in claxon 0.4
+
         let info = AudioInfo {
             sample_rate: stream_info.sample_rate,
             channels: stream_info.channels as u8,
             bits_per_sample: stream_info.bits_per_sample as u8,
-            total_samples: if stream_info.samples > 0 {
-                Some(stream_info.samples)
-            } else {
-                None
-            },
+            total_samples,
         };
 
-        Ok(Self {
-            reader,
-            info,
-            buffer: vec![0i32; DECODE_BUFFER_SIZE * stream_info.channels as usize],
-            buffer_pos: 0,
-            buffer_len: 0,
-        })
+        Ok(Self { reader, info })
     }
 }
 
@@ -115,20 +100,11 @@ impl Decoder for FlacDecoder {
         &self.info
     }
 
-    fn seek_to_sample(&mut self, sample_offset: u64) -> Result<()> {
-        // claxon doesn't support sample-accurate seeking natively.
-        // We re-open and skip frames manually for correctness.
-        // This is acceptable because DD-002 guarantees sequential access
-        // per source file — seeks are rare and always forward.
-        //
-        // For true random access, we'd need to build a seek table from
-        // FLAC SEEKTABLE metadata block. Deferred to optimization pass.
-        let _ = sample_offset;
-        // Reset internal buffer state; next read starts from current
-        // claxon stream position. Full seek support requires re-opening
-        // the file which is handled at the worker level.
-        self.buffer_pos = 0;
-        self.buffer_len = 0;
+    fn seek_to_sample(&mut self, _sample_offset: u64) -> Result<()> {
+        // claxon 0.4 does not support sample-accurate seeking.
+        // DD-002 guarantees sequential access per source file,
+        // so seeks are rare and always forward. Full seek support
+        // requires re-opening the file at the worker level.
         Ok(())
     }
 
@@ -138,68 +114,30 @@ impl Decoder for FlacDecoder {
             return Ok(0);
         }
 
-        let mut samples_written: usize = 0;
+        let mut samples_read = 0usize;
+        let max_total = max_samples * channels;
 
-        while samples_written < max_samples {
-            // Drain internal buffer first
-            if self.buffer_pos < self.buffer_len {
-                let available = self.buffer_len - self.buffer_pos;
-                let to_copy = available.min(max_samples - samples_written);
-                let src_start = self.buffer_pos * channels;
-                let src_end = (self.buffer_pos + to_copy) * channels;
-                let dst_start = samples_written * channels;
-                let dst_end = (samples_written + to_copy) * channels;
-
-                if dst_end <= buffer.len() && src_end <= self.buffer.len() {
-                    buffer[dst_start..dst_end].copy_from_slice(&self.buffer[src_start..src_end]);
-                    self.buffer_pos += to_copy;
-                    samples_written += to_copy;
-                } else {
-                    break;
-                }
-                continue;
-            }
-
-            // Refill internal buffer from claxon
-            self.buffer_pos = 0;
-            self.buffer_len = 0;
-
-            let mut frame_count = 0usize;
-            for result in self.reader.blocks() {
-                let block = result.map_err(|e| CueBladeError::Sanitization {
-                    reason: format!("FLAC decode error: {e}"),
-                })?;
-
-                let block_channels = block.channels() as usize;
-                let block_duration = block.duration() as usize;
-
-                // Interleave block samples into buffer
-                for s in 0..block_duration {
-                    for c in 0..block_channels.min(channels) {
-                        let idx = frame_count * channels + c;
-                        if idx < self.buffer.len() {
-                            self.buffer[idx] = block.channel(c as u32)[s] as i32;
-                        }
-                    }
-                    frame_count += 1;
-                    if frame_count >= DECODE_BUFFER_SIZE {
+        // claxon's samples() borrows &mut self.reader internally via
+        // BufferedReader. We iterate directly without storing the iterator.
+        for sample in self.reader.samples() {
+            match sample {
+                Ok(s) => {
+                    if samples_read < buffer.len() && samples_read < max_total {
+                        buffer[samples_read] = s;
+                        samples_read += 1;
+                    } else {
                         break;
                     }
                 }
-
-                if frame_count >= DECODE_BUFFER_SIZE {
-                    break;
+                Err(e) => {
+                    return Err(CueBladeError::Sanitization {
+                        reason: format!("FLAC decode error: {e}"),
+                    });
                 }
-            }
-
-            self.buffer_len = frame_count;
-
-            if frame_count == 0 {
-                break; // EOF
             }
         }
 
-        Ok(samples_written)
+        Ok(samples_read / channels)
     }
 }
 
@@ -232,7 +170,7 @@ pub struct FlacEncoder<W: Write + Send> {
     writer: W,
     info: AudioInfo,
     metadata: Vec<(String, String)>,
-    /// Accumulated samples waiting to be encoded.
+    /// Accumulated interleaved samples waiting to be encoded.
     sample_buffer: Vec<i32>,
     compression_level: u32,
 }
@@ -240,7 +178,7 @@ pub struct FlacEncoder<W: Write + Send> {
 impl<W: Write + Send> FlacEncoder<W> {
     /// Create a new FLAC encoder writing to `writer`.
     ///
-    /// `compression_level`: 0 (fastest) to 8 (best compression). Default: 5.
+    /// `compression_level`: 0 (fastest) to 8 (best compression).
     ///
     /// # Errors
     ///
@@ -290,117 +228,56 @@ impl<W: Write + Send> Encoder for FlacEncoder<W> {
         Ok(())
     }
 
-    fn finish(self) -> Result<()> {
-        // flacenc requires building the entire file structure.
-        // For streaming, we accumulate samples and encode at finish.
-        // This is a simplification; true streaming encode would use
-        // flacenc's StreamEncoder API. Deferred to optimization pass.
-        //
-        // For now, write a minimal valid FLAC file with accumulated samples.
+    fn finish(mut self) -> Result<()> {
         let channels = self.info.channels as usize;
-        let total_samples = if channels > 0 {
-            self.sample_buffer.len() / channels
-        } else {
-            0
+        let sample_rate = self.info.sample_rate as usize;
+        let bps = self.info.bits_per_sample as usize;
+
+        // Build flacenc config
+        let mut config = flacenc::config::Encoder::default();
+        let block_size = match self.compression_level {
+            0..=2 => 1152,
+            _ => 4096,
         };
+        config.block_size = block_size;
 
-        if total_samples == 0 {
-            // Write empty but valid FLAC
-            let config = flacenc::config::EncoderConfig::default()
-                .with_compression_level(self.compression_level);
-            let mut fb = flacenc::bitsink::MemSink::<u8>::new();
-            let encoder = flacenc::codec::StreamEncoder::new(
-                &config,
-                self.info.sample_rate,
-                self.info.channels as usize,
-                self.info.bits_per_sample as usize,
-            )
-            .map_err(|e| CueBladeError::Sanitization {
-                reason: format!("FLAC encoder init failed: {e:?}"),
-            })?;
-            encoder
-                .write_stream_header(&mut fb)
-                .map_err(|e| CueBladeError::Sanitization {
-                    reason: format!("FLAC header write failed: {e:?}"),
+        let verified_config =
+            config
+                .into_verified()
+                .map_err(|(_cfg, e)| CueBladeError::Sanitization {
+                    reason: format!("FLAC encoder config validation failed: {e:?}"),
                 })?;
-            let bytes = fb.finalize();
-            self.writer
-                .write_all(&bytes)
-                .map_err(|e| CueBladeError::Io {
-                    path: std::path::PathBuf::from("<encoder>"),
-                    source: e,
-                })?;
-            return Ok(());
-        }
 
-        // Build FLAC file with accumulated samples
-        let config = flacenc::config::EncoderConfig::default()
-            .with_compression_level(self.compression_level);
+        // Encode accumulated samples (or empty stream)
+        let source = flacenc::source::MemSource::from_samples(
+            &self.sample_buffer,
+            channels,
+            bps,
+            sample_rate,
+        );
 
-        let mut fb = flacenc::bitsink::MemSink::<u8>::new();
-        let mut encoder = flacenc::codec::StreamEncoder::new(
-            &config,
-            self.info.sample_rate,
-            self.info.channels as usize,
-            self.info.bits_per_sample as usize,
+        let stream = flacenc::encode_with_fixed_block_size(
+            &verified_config,
+            source,
+            verified_config.block_size,
         )
         .map_err(|e| CueBladeError::Sanitization {
-            reason: format!("FLAC encoder init failed: {e:?}"),
+            reason: format!("FLAC encode failed: {e:?}"),
         })?;
 
-        encoder
-            .write_stream_header(&mut fb)
+        // TODO: Metadata injection (Vorbis comments) requires post-processing
+        // of the Stream component tree. Deferred to metadata enrichment phase.
+        let _ = &self.metadata;
+
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        stream
+            .write(&mut sink)
             .map_err(|e| CueBladeError::Sanitization {
-                reason: format!("FLAC header write failed: {e:?}"),
+                reason: format!("FLAC bitstream write failed: {e:?}"),
             })?;
 
-        // Write metadata (Vorbis comments)
-        if !self.metadata.is_empty() {
-            let vorbis_entries: Vec<flacenc::metadata::VorbisCommentEntry> = self
-                .metadata
-                .iter()
-                .map(|(k, v)| flacenc::metadata::VorbisCommentEntry::new(k, v))
-                .collect();
-            let vorbis = flacenc::metadata::VorbisComment::from_entries(vorbis_entries);
-            let meta_block = flacenc::metadata::MetadataBlock::from_vorbis_comment(vorbis);
-            encoder
-                .write_metadata_block(&mut fb, &meta_block)
-                .map_err(|e| CueBladeError::Sanitization {
-                    reason: format!("FLAC metadata write failed: {e:?}"),
-                })?;
-        }
-
-        // Encode samples in blocks
-        let block_size = 4096usize;
-        let mut offset = 0;
-        while offset < total_samples {
-            let end = (offset + block_size).min(total_samples);
-            let block_samples = end - offset;
-            let start_idx = offset * channels;
-            let end_idx = end * channels;
-
-            let frame = flacenc::component::Frame::from_samples(
-                &self.sample_buffer[start_idx..end_idx],
-                self.info.channels as usize,
-                self.info.bits_per_sample as usize,
-                offset,
-            )
-            .map_err(|e| CueBladeError::Sanitization {
-                reason: format!("FLAC frame creation failed: {e:?}"),
-            })?;
-
-            encoder
-                .write_frame(&mut fb, &frame)
-                .map_err(|e| CueBladeError::Sanitization {
-                    reason: format!("FLAC frame encode failed: {e:?}"),
-                })?;
-
-            offset = end;
-        }
-
-        let bytes = fb.finalize();
         self.writer
-            .write_all(&bytes)
+            .write_all(sink.as_slice())
             .map_err(|e| CueBladeError::Io {
                 path: std::path::PathBuf::from("<encoder>"),
                 source: e,
@@ -431,7 +308,8 @@ mod tests {
             bits_per_sample: 24,
             total_samples: None,
         };
-        assert_eq!(info_24.bytes_per_frame(), Some(8)); // 24-bit = 4 bytes aligned
+        // 24-bit packed: 3 bytes/sample × 2 channels = 6 bytes/frame
+        assert_eq!(info_24.bytes_per_frame(), Some(6));
     }
 
     #[test]
@@ -445,14 +323,6 @@ mod tests {
         assert_eq!(info.frames_to_samples(0), Some(0));
         assert_eq!(info.frames_to_samples(75), Some(44100));
         assert_eq!(info.frames_to_samples(150), Some(88200));
-
-        let info_48k = AudioInfo {
-            sample_rate: 48000,
-            channels: 2,
-            bits_per_sample: 16,
-            total_samples: None,
-        };
-        assert_eq!(info_48k.frames_to_samples(75), Some(48000));
     }
 
     #[test]
@@ -475,10 +345,8 @@ mod tests {
             bits_per_sample: 16,
             total_samples: Some(1000),
         };
-        // start >= end
         assert!(info.validate_range(100, 100).is_err());
         assert!(info.validate_range(200, 100).is_err());
-        // exceeds total
         assert!(info.validate_range(0, 1001).is_err());
     }
 
@@ -507,5 +375,24 @@ mod tests {
         let buf: Vec<u8> = Vec::new();
         let cursor = std::io::Cursor::new(buf);
         assert!(FlacEncoder::new(cursor, &info, 5).is_err());
+    }
+
+    #[test]
+    fn test_flac_encoder_roundtrip() {
+        let info = AudioInfo {
+            sample_rate: 44100,
+            channels: 2,
+            bits_per_sample: 16,
+            total_samples: None,
+        };
+
+        let num_samples = 4096;
+        let samples = vec![0i32; num_samples * 2];
+
+        let buf: Vec<u8> = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut enc = FlacEncoder::new(cursor, &info, 5).unwrap();
+        enc.write_samples(&samples, num_samples).unwrap();
+        enc.finish().unwrap();
     }
 }

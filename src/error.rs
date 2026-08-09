@@ -52,3 +52,12 @@ pub enum CueBladeError {
 
 /// Result alias using [`CueBladeError`].
 pub type Result<T> = std::result::Result<T, CueBladeError>;
+
+impl From<std::io::Error> for CueBladeError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io {
+            path: std::path::PathBuf::from("<unknown>"),
+            source: e,
+        }
+    }
+}

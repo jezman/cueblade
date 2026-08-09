@@ -9,14 +9,14 @@ use crate::error::Result;
 /// Trait for streaming audio decoders.
 ///
 /// Implementations must be safe (no unsafe), support seeking by
-/// sample offset, and provide header metadata via [`audio_info()`].
+/// sample offset, and provide header metadata via [`Decoder::audio_info`].
 pub trait Decoder: Send {
     /// Return audio stream metadata.
     fn audio_info(&self) -> &AudioInfo;
 
     /// Seek to an absolute sample offset (per-channel).
     ///
-    /// Next call to [`read_samples()`] will start from this position.
+    /// Next call to [`Decoder::read_samples`] will start from this position.
     fn seek_to_sample(&mut self, sample_offset: u64) -> Result<()>;
 
     /// Read up to `max_samples` per-channel samples into `buffer`.
