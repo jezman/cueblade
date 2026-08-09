@@ -1,0 +1,13 @@
+[package]
+name = "cueblade"
+description = "reserved for future use"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chardetng = "1"
+encoding_rs = "0.8"
+thiserror = "2"
+winnow = "1"
