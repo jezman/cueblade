@@ -14,7 +14,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
-            process::exit(2);
+            process::exit(2); // CLI argument error — before CueBladeError exists
         }
     };
 
@@ -28,6 +28,6 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
-        process::exit(1);
+        process::exit(e.exit_code());
     }
 }
