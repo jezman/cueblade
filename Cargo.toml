@@ -8,7 +8,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 chardetng = "1"
+claxon = "0.4"
 encoding_rs = "0.8"
+flacenc = "0.5"
 thiserror = "2"
 winnow = "1"
 
