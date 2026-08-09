@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = OverwriteMode::Skip)]
     pub overwrite: OverwriteMode,
 
+    /// How to handle pre-gap regions between tracks.
+    #[arg(long, value_enum, default_value_t = GapMode::Prepend)]
+    pub gap_handling: GapMode,
+
     /// Show processing plan without writing any files.
     #[arg(long)]
     pub dry_run: bool,
@@ -49,6 +53,17 @@ pub enum OverwriteMode {
     Overwrite,
     /// Overwrite only if source audio is newer than output.
     Newer,
+}
+
+/// Gap handling mode for pre-gap regions between tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GapMode {
+    /// Include pre-gap in the current track (extend start to INDEX 00).
+    Prepend,
+    /// Include pre-gap of next track at end of current track.
+    Append,
+    /// Discard all pre-gap regions (use only INDEX 01 boundaries).
+    Discard,
 }
 
 /// Resolved CLI mode after argument validation.
@@ -71,6 +86,8 @@ pub struct ResolvedConfig {
     pub template: String,
     /// Overwrite policy.
     pub overwrite: OverwriteMode,
+    /// Gap handling mode.
+    pub gap_handling: GapMode,
     /// Dry-run mode enabled.
     pub dry_run: bool,
     /// Silent mode enabled.
@@ -102,6 +119,7 @@ impl Cli {
             mode,
             template: self.template,
             overwrite: self.overwrite,
+            gap_handling: self.gap_handling,
             dry_run: self.dry_run,
             silent: self.silent,
         })
