@@ -104,6 +104,13 @@ pub fn sanitize(cue: CueSheet, base_dir: &Path) -> Result<SanitizedCue> {
     // 1. Encoding post-check
     check_encoding(&cue)?;
 
+    // Reject empty track lists
+    if cue.tracks.is_empty() {
+        return Err(CueBladeError::Sanitization {
+            reason: "CUE sheet contains no tracks".into(),
+        });
+    }
+
     // 2. Timestamp repair
     let mut repaired = cue.clone();
     repair_timestamps(&mut repaired);
