@@ -108,7 +108,7 @@ fn parse_cue_str(input: &str) -> winnow::Result<CueSheet> {
         }
 
         // Skip unknown lines gracefully
-        if skip_line.parse_next(&mut remaining).is_ok() {
+        if skip_line.parse_next(&mut remaining).is_ok() && remaining.len() < before_len {
             continue;
         }
 
@@ -248,7 +248,7 @@ fn parse_track_block(input: &mut &str) -> winnow::Result<Track> {
         // Peek: if we hit another top-level directive, stop consuming
         // Note: TITLE and PERFORMER are valid both at global AND track level,
         // so we must NOT break on them here — let the sub-parsers handle them.
-        if input.starts_with("TRACK ") || input.starts_with("FILE ") || input.starts_with("REM ") {
+        if input.starts_with("TRACK ") || input.starts_with("FILE ") {
             break;
         }
 
@@ -271,6 +271,12 @@ fn parse_track_block(input: &mut &str) -> winnow::Result<Track> {
             isrc = Some(code);
             continue;
         }
+
+        // REM is valid inside track blocks too — just consume and discard
+        if parse_rem.parse_next(input).is_ok() {
+            continue;
+        }
+
         // Skip unrecognized sub-line
         if skip_line.parse_next(input).is_ok() {
             // Only continue if we made progress
@@ -283,16 +289,6 @@ fn parse_track_block(input: &mut &str) -> winnow::Result<Track> {
 
         // No parser matched and no progress → done with track block
         break;
-
-        // // Skip unrecognized sub-line
-        // if skip_line.parse_next(input).is_ok() {
-        //     continue;
-        // }
-
-        // // No progress → break to avoid infinite loop
-        // if input.len() == before_len {
-        //     break;
-        // }
     }
 
     Ok(Track {

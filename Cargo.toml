@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 claxon = "0.4"
 encoding_rs = "0.8"
 flacenc = "0.5"
+metaflac = "0.2"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 winnow = "1"

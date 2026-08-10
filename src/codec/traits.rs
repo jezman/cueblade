@@ -25,6 +25,9 @@ pub trait Decoder: Send {
     /// Samples are interleaved for multi-channel audio.
     /// Returns 0 at EOF.
     fn read_samples(&mut self, buffer: &mut [i32], max_samples: usize) -> Result<usize>;
+
+    /// Get Vorbis comment tags from the source file.
+    fn tags(&self) -> &[(String, String)];
 }
 
 /// Trait for streaming audio encoders.

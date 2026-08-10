@@ -24,28 +24,14 @@ use crate::error::{CueBladeError, Result};
 /// multiple calls impossible without storing the iterator.
 /// For Phase 1 this is acceptable; true streaming decode will
 /// be optimized in a future pass.
-///
-/// # Examples
-///
-/// ```no_run
-/// use cueblade::codec::flac::FlacDecoder;
-/// use cueblade::codec::Decoder;
-/// use std::path::Path;
-///
-/// let mut dec = FlacDecoder::open(Path::new("album.flac")).unwrap();
-/// let info = dec.audio_info();
-/// println!("{} Hz, {} ch, {} bps", info.sample_rate, info.channels, info.bits_per_sample);
-///
-/// let mut buf = vec![0i32; 4096 * 2]; // stereo buffer
-/// let read = dec.read_samples(&mut buf, 4096).unwrap();
-/// println!("Read {read} samples per channel");
-/// ```
 pub struct FlacDecoder {
     info: AudioInfo,
     /// All decoded samples (interleaved i32).
     samples: Vec<i32>,
     /// Current read position in samples (per channel).
     position: usize,
+    /// Vorbis comment tags read from the source FLAC file.
+    tags: Vec<(String, String)>,
 }
 
 impl FlacDecoder {
@@ -103,13 +89,27 @@ impl FlacDecoder {
                 reason: format!("FLAC decode error: {e}"),
             })?;
             samples.push(s);
-            if samples.len() % 100000 == 0 {}
         }
+
+        // Read all Vorbis comments from source FLAC via metaflac
+        let tags = metaflac::Tag::read_from_path(path)
+            .ok()
+            .and_then(|tag| tag.vorbis_comments().cloned())
+            .map(|vc| {
+                vc.comments
+                    .into_iter()
+                    .flat_map(|(key, values)| {
+                        values.into_iter().map(move |v| (key.to_uppercase(), v))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             info,
             samples,
             position: 0,
+            tags,
         })
     }
 }
@@ -131,23 +131,22 @@ impl Decoder for FlacDecoder {
         if channels == 0 {
             return Ok(0);
         }
-
         let available_total = self.samples.len().saturating_sub(self.position);
         let available_samples = available_total / channels;
         let to_read = max_samples.min(available_samples);
-
         if to_read == 0 {
             return Ok(0);
         }
-
         let src_start = self.position;
         let src_end = self.position + to_read * channels;
         let dst_end = to_read * channels;
-
         buffer[..dst_end].copy_from_slice(&self.samples[src_start..src_end]);
         self.position = src_end;
-
         Ok(to_read)
+    }
+
+    fn tags(&self) -> &[(String, String)] {
+        &self.tags
     }
 }
 
@@ -155,27 +154,6 @@ impl Decoder for FlacDecoder {
 ///
 /// Writes interleaved PCM samples to any [`Write`] target with
 /// configurable compression level and Vorbis comment metadata.
-///
-/// # Examples
-///
-/// ```no_run
-/// use cueblade::codec::flac::FlacEncoder;
-/// use cueblade::codec::{AudioInfo, Encoder};
-/// use std::fs::File;
-///
-/// let info = AudioInfo {
-///     sample_rate: 44100,
-///     channels: 2,
-///     bits_per_sample: 16,
-///     total_samples: None,
-/// };
-/// let file = File::create("output.flac").unwrap();
-/// let mut enc = FlacEncoder::new(file, &info, 5).unwrap();
-/// enc.set_metadata(vec![("TITLE".into(), "Track One".into())]);
-/// let samples = vec![0i32; 4096 * 2];
-/// enc.write_samples(&samples, 4096).unwrap();
-/// enc.finish().unwrap();
-/// ```
 pub struct FlacEncoder<W: Write + Send> {
     writer: W,
     info: AudioInfo,
@@ -183,6 +161,37 @@ pub struct FlacEncoder<W: Write + Send> {
     /// Accumulated interleaved samples waiting to be encoded.
     sample_buffer: Vec<i32>,
     compression_level: u32,
+}
+
+/// Encode a list of (key, value) pairs into Vorbis Comment binary format.
+///
+/// Format per https://xiph.org/vorbis/doc/Vorbis_I_spec.html#x1-640005:
+/// - 4 bytes LE: vendor string length
+/// - N bytes: vendor string (UTF-8)
+/// - 4 bytes LE: number of comments
+/// - For each comment:
+///   - 4 bytes LE: comment length
+///   - M bytes: "KEY=value" (UTF-8, KEY uppercase ASCII)
+fn encode_vorbis_comment(tags: &[(String, String)]) -> Vec<u8> {
+    let vendor = "cueblade 0.1.0";
+    let vendor_bytes = vendor.as_bytes();
+    let mut buf = Vec::new();
+
+    // Vendor string
+    buf.extend_from_slice(&(vendor_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(vendor_bytes);
+
+    // Number of comments
+    buf.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+
+    // Each comment: "KEY=value"
+    for (key, value) in tags {
+        let comment = format!("{key}={value}");
+        let comment_bytes = comment.as_bytes();
+        buf.extend_from_slice(&(comment_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(comment_bytes);
+    }
+    buf
 }
 
 impl<W: Write + Send> FlacEncoder<W> {
@@ -207,7 +216,6 @@ impl<W: Write + Send> FlacEncoder<W> {
                 ),
             });
         }
-
         Ok(Self {
             writer,
             info: info.clone(),
@@ -258,7 +266,7 @@ impl<W: Write + Send> Encoder for FlacEncoder<W> {
                     reason: format!("FLAC encoder config validation failed: {e:?}"),
                 })?;
 
-        // Encode accumulated samples (or empty stream)
+        // Encode accumulated samples
         let source = flacenc::source::MemSource::from_samples(
             &self.sample_buffer,
             channels,
@@ -266,7 +274,7 @@ impl<W: Write + Send> Encoder for FlacEncoder<W> {
             sample_rate,
         );
 
-        let stream = flacenc::encode_with_fixed_block_size(
+        let mut stream = flacenc::encode_with_fixed_block_size(
             &verified_config,
             source,
             verified_config.block_size,
@@ -275,9 +283,15 @@ impl<W: Write + Send> Encoder for FlacEncoder<W> {
             reason: format!("FLAC encode failed: {e:?}"),
         })?;
 
-        // TODO: Metadata injection (Vorbis comments) requires post-processing
-        // of the Stream component tree. Deferred to metadata enrichment phase.
-        let _ = &self.metadata;
+        // Inject Vorbis comment metadata block (type=4)
+        if !self.metadata.is_empty() {
+            let vc_bytes = encode_vorbis_comment(&self.metadata);
+            let meta_block = flacenc::component::MetadataBlockData::new_unknown(4, &vc_bytes)
+                .map_err(|e| CueBladeError::Sanitization {
+                    reason: format!("Failed to create Vorbis comment block: {e:?}"),
+                })?;
+            stream.add_metadata_block(meta_block);
+        }
 
         let mut sink = flacenc::bitsink::ByteSink::new();
         stream
@@ -395,10 +409,8 @@ mod tests {
             bits_per_sample: 16,
             total_samples: None,
         };
-
         let num_samples = 4096;
         let samples = vec![0i32; num_samples * 2];
-
         let buf: Vec<u8> = Vec::new();
         let cursor = std::io::Cursor::new(buf);
         let mut enc = FlacEncoder::new(cursor, &info, 5).unwrap();
