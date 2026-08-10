@@ -238,15 +238,17 @@ fn parse_track_block(input: &mut &str) -> winnow::Result<Track> {
     let mut isrc: Option<String> = None;
 
     loop {
+        let _ = space0::<_, ContextError>.parse_next(input);
         let before_len = input.len();
 
+        if input.is_empty() {
+            break;
+        }
+
         // Peek: if we hit another top-level directive, stop consuming
-        if input.starts_with("TRACK ")
-            || input.starts_with("FILE ")
-            || input.starts_with("REM ")
-            || input.starts_with("PERFORMER ")
-            || input.starts_with("TITLE ")
-        {
+        // Note: TITLE and PERFORMER are valid both at global AND track level,
+        // so we must NOT break on them here — let the sub-parsers handle them.
+        if input.starts_with("TRACK ") || input.starts_with("FILE ") || input.starts_with("REM ") {
             break;
         }
 
@@ -269,16 +271,28 @@ fn parse_track_block(input: &mut &str) -> winnow::Result<Track> {
             isrc = Some(code);
             continue;
         }
-
         // Skip unrecognized sub-line
         if skip_line.parse_next(input).is_ok() {
-            continue;
-        }
-
-        // No progress → break to avoid infinite loop
-        if input.len() == before_len {
+            // Only continue if we made progress
+            if input.len() < before_len {
+                continue;
+            }
+            // No progress on empty/whitespace-only input → done with track block
             break;
         }
+
+        // No parser matched and no progress → done with track block
+        break;
+
+        // // Skip unrecognized sub-line
+        // if skip_line.parse_next(input).is_ok() {
+        //     continue;
+        // }
+
+        // // No progress → break to avoid infinite loop
+        // if input.len() == before_len {
+        //     break;
+        // }
     }
 
     Ok(Track {
