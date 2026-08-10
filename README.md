@@ -1,14 +1,13 @@
 # cueblade
 
 [![Crates.io](https://img.shields.io/crates/v/cueblade?logo=rust)](https://crates.io/crates/cueblade)
-[![docs.rs](https://img.shields.io/docsrs/cueblade?logo=docsdotrs)](https://docs.rs/cueblade)
 [![CI](https://github.com/jezman/cueblade/actions/workflows/ci.yml/badge.svg)](https://github.com/jezman/cueblade/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/cueblade.svg)](#license)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](#minimum-supported-rust-version)
 
 A fast, reliable, and safe lossless audio splitter for FLAC images driven by CUE sheets. Written in pure Rust with no unsafe code.
 
-> **Status:** v0.1.0 (Phase 1 MVP). Currently supports explicit FLAC splitting with full metadata preservation. Auto-discovery, parallelism, and multi-format support are planned for future releases.
+> **Status:** v0.1.2 (Phase 1 MVP). Currently supports explicit FLAC splitting with full metadata preservation. Auto-discovery, parallelism, and multi-format support are planned for future releases.
 
 ## Features (v0.1.0)
 

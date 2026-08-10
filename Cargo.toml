@@ -1,11 +1,10 @@
 [package]
 name = "cueblade"
 description = "A fast, safe, pure-Rust FLAC image splitter driven by CUE sheets with metadata preservation and atomic writes"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-documentation = "https://docs.rs/cueblade"
 repository = "https://github.com/jezman/cueblade"
 readme = "README.md"
 keywords = ["flac", "cue", "audio", "splitter", "lossless"]
