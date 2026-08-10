@@ -16,10 +16,14 @@ use super::traits::{Decoder, Encoder};
 use super::types::AudioInfo;
 use crate::error::{CueBladeError, Result};
 
-/// Streaming FLAC decoder backed by `claxon`.
+/// FLAC decoder backed by `claxon`.
 ///
-/// Opens a FLAC file, validates the header, and provides
-/// sample-accurate seeking and streaming read.
+/// Reads all samples into memory at open time for reliable
+/// sequential and seekable access. claxon's sample iterator
+/// borrows the reader mutably, making incremental reads across
+/// multiple calls impossible without storing the iterator.
+/// For Phase 1 this is acceptable; true streaming decode will
+/// be optimized in a future pass.
 ///
 /// # Examples
 ///
@@ -37,26 +41,29 @@ use crate::error::{CueBladeError, Result};
 /// println!("Read {read} samples per channel");
 /// ```
 pub struct FlacDecoder {
-    reader: FlacReader<BufReader<File>>,
     info: AudioInfo,
+    /// All decoded samples (interleaved i32).
+    samples: Vec<i32>,
+    /// Current read position in samples (per channel).
+    position: usize,
 }
 
 impl FlacDecoder {
-    /// Open a FLAC file for streaming decode.
+    /// Open a FLAC file and decode all samples into memory.
     ///
     /// Validates header fields (sample rate, channels, bps) per SECURITY.md.
     ///
     /// # Errors
     ///
     /// - [`CueBladeError::Io`] if file cannot be opened.
-    /// - [`CueBladeError::Sanitization`] if header contains unsupported values.
+    /// - [`CueBladeError::Sanitization`] if header is invalid or decode fails.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|e| CueBladeError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
         let buf_reader = BufReader::with_capacity(256 * 1024, file);
-        let reader = FlacReader::new(buf_reader).map_err(|e| CueBladeError::Sanitization {
+        let mut reader = FlacReader::new(buf_reader).map_err(|e| CueBladeError::Sanitization {
             reason: format!("Invalid FLAC header in `{}`: {e}", path.display()),
         })?;
 
@@ -82,16 +89,28 @@ impl FlacDecoder {
             });
         }
 
-        let total_samples = stream_info.samples; // Option<u64> in claxon 0.4
-
         let info = AudioInfo {
             sample_rate: stream_info.sample_rate,
             channels: stream_info.channels as u8,
             bits_per_sample: stream_info.bits_per_sample as u8,
-            total_samples,
+            total_samples: stream_info.samples,
         };
 
-        Ok(Self { reader, info })
+        // Read all samples into memory
+        let mut samples = Vec::new();
+        for sample in reader.samples() {
+            let s = sample.map_err(|e| CueBladeError::Sanitization {
+                reason: format!("FLAC decode error: {e}"),
+            })?;
+            samples.push(s);
+            if samples.len() % 100000 == 0 {}
+        }
+
+        Ok(Self {
+            info,
+            samples,
+            position: 0,
+        })
     }
 }
 
@@ -100,11 +119,10 @@ impl Decoder for FlacDecoder {
         &self.info
     }
 
-    fn seek_to_sample(&mut self, _sample_offset: u64) -> Result<()> {
-        // claxon 0.4 does not support sample-accurate seeking.
-        // DD-002 guarantees sequential access per source file,
-        // so seeks are rare and always forward. Full seek support
-        // requires re-opening the file at the worker level.
+    fn seek_to_sample(&mut self, sample_offset: u64) -> Result<()> {
+        let channels = self.info.channels as usize;
+        let target = sample_offset as usize * channels;
+        self.position = target.min(self.samples.len());
         Ok(())
     }
 
@@ -114,30 +132,22 @@ impl Decoder for FlacDecoder {
             return Ok(0);
         }
 
-        let mut samples_read = 0usize;
-        let max_total = max_samples * channels;
+        let available_total = self.samples.len().saturating_sub(self.position);
+        let available_samples = available_total / channels;
+        let to_read = max_samples.min(available_samples);
 
-        // claxon's samples() borrows &mut self.reader internally via
-        // BufferedReader. We iterate directly without storing the iterator.
-        for sample in self.reader.samples() {
-            match sample {
-                Ok(s) => {
-                    if samples_read < buffer.len() && samples_read < max_total {
-                        buffer[samples_read] = s;
-                        samples_read += 1;
-                    } else {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    return Err(CueBladeError::Sanitization {
-                        reason: format!("FLAC decode error: {e}"),
-                    });
-                }
-            }
+        if to_read == 0 {
+            return Ok(0);
         }
 
-        Ok(samples_read / channels)
+        let src_start = self.position;
+        let src_end = self.position + to_read * channels;
+        let dst_end = to_read * channels;
+
+        buffer[..dst_end].copy_from_slice(&self.samples[src_start..src_end]);
+        self.position = src_end;
+
+        Ok(to_read)
     }
 }
 
